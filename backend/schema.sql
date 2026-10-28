@@ -2704,57 +2704,84 @@ returns table (
   is_owner boolean,
   access_role text
 )
-language sql
+language plpgsql
 stable
 set search_path = public
 as $$
-  select
-    c.id,
-    c.project_id,
-    c.user_id::text as user_id,
-    c.title,
-    c.model,
-    c.created_at,
-    c.updated_at,
-    p.name as project_name,
-    -- Provenance ("I started this thread"), not a role: the ladder itself is
-    -- lib/permissions.ts, and the creator branch of ensureChatAccess is what
-    -- turns this into Owner standing.
-    coalesce(c.user_id::text = p_user_id, false) as is_owner,
-    -- The SAME verdict the predicate below filters on, served to the caller.
-    -- Serving only is_owner was not enough: the client must distinguish
-    -- Editor and Viewer from Owner so its actions match the server verdict.
-    -- One evaluation, one truth: the lateral computes the role once and both
-    -- the column and the WHERE read it.
-    verdict.role as access_role
-  from public.chats c
+declare
+  candidate record;
+  skipped integer := 0;
+  returned integer := 0;
+  row_limit integer := case when p_limit is null then null else greatest(1,least(p_limit,100)) end;
+begin
+  for candidate in
+  -- Narrow with indexed identity/grant lookups before invoking the canonical
+  -- permission function. Walking every tenant's chats in updated_at order
+  -- makes an inactive user's first page cost grow with unrelated traffic.
+  -- These candidates are an over-approximation, never an access decision.
+  with actor as materialized (
+    select case
+      when p_user_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      then p_user_id::uuid
+    end as id
+  ), member_orgs as materialized (
+    select m.org_id from public.org_members m
+    join actor a on a.id = m.user_id
+  ), candidate_projects as materialized (
+    select p.id from public.projects p join actor a on a.id = p.user_id
+    union
+    select g.project_id from public.project_access_grants g
+      where coalesce(p_user_email, '') <> '' and g.email = lower(p_user_email)
+    union
+    select p.id from public.projects p join member_orgs m on m.org_id = p.org_id
+  ), candidate_ids as materialized (
+    select c.id from public.chats c join actor a on a.id = c.user_id
+    union
+    select g.chat_id from public.chat_access_grants g
+      where coalesce(p_user_email, '') <> '' and g.email = lower(p_user_email)
+    union
+    select c.id from public.chats c join member_orgs m on m.org_id = c.org_id
+    union
+    select c.id from public.chats c
+      join candidate_projects p on p.id = c.project_id
+  )
+  select c.*, p.name as project_name
+  from candidate_ids ids
+  join public.chats c on c.id = ids.id
   left join public.projects p on p.id = c.project_id
-  cross join lateral (
-    select public.chat_access_role(
-             c.id,
-             c.user_id,
-             c.project_id,
-             c.org_id,
-             p_user_id,
-             p_user_email
-           ) as role
-  ) verdict
-  -- The whole predicate, in one call.
-  -- The join above is for project_name only; the function resolves the
-  -- project itself.
-  where verdict.role is not null
-    and public.workspace_matches(p_workspace, c.org_id)
+  where public.workspace_matches(p_workspace, c.org_id)
     and (
       p_before_updated_at is null
       or c.updated_at < p_before_updated_at
       or (c.updated_at = p_before_updated_at and c.id > p_before_id)
     )
   order by c.updated_at desc, c.id asc
-  limit case
-    when p_limit is null then null
-    else greatest(1, least(p_limit, 100))
-  end
-  offset greatest(coalesce(p_offset, 0), 0);
+  loop
+    -- Evaluate the authoritative verdict once, and stop after a page. In
+    -- particular, do not materialize role checks for all of an active user's
+    -- old chats just to return their newest fifty.
+    access_role := public.chat_access_role(
+      candidate.id,candidate.user_id,candidate.project_id,candidate.org_id,p_user_id,p_user_email
+    );
+    if access_role is null then continue; end if;
+    if skipped < greatest(coalesce(p_offset,0),0) then
+      skipped := skipped + 1;
+      continue;
+    end if;
+    id := candidate.id;
+    project_id := candidate.project_id;
+    user_id := candidate.user_id::text;
+    title := candidate.title;
+    model := candidate.model;
+    created_at := candidate.created_at;
+    updated_at := candidate.updated_at;
+    project_name := candidate.project_name;
+    is_owner := coalesce(candidate.user_id::text = p_user_id,false);
+    return next;
+    returned := returned + 1;
+    if row_limit is not null and returned >= row_limit then exit; end if;
+  end loop;
+end;
 $$;
 
 create table if not exists public.chat_messages (
@@ -11126,5 +11153,6 @@ insert into public.schema_migrations (filename) values
   ('20261024_02_workspace_scoped_data_deletion.sql'),
   ('20261024_03_backfill_project_child_org_id.sql'),
   ('20261024_04_org_member_data_policy.sql'),
-  ('20261027_01_document_text_failed_jobs.sql')
+  ('20261027_01_document_text_failed_jobs.sql'),
+  ('20261029_01_chat_overview_candidates.sql')
 on conflict (filename) do nothing;
