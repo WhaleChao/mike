@@ -32,7 +32,20 @@ records the final transport boundary that closes them. Internal source-code
 filenames identify the failing code; client document filenames are excluded.
 
 Resolution order, per runtime: `*_SENTRY_DISABLED=true` → off;
-`*_SENTRY_DSN` set → that DSN; otherwise the built-in Mike project DSN. Backend test
+`*_SENTRY_DSN` set → that DSN; otherwise the built-in Mike project DSN. For the
+web app one rule, `reportingDestination` in `frontend/src/app/lib/errorReporting.ts`,
+decides for the Next server's own events and for every browser envelope alike
+(the browser posts to `/monitoring`, `frontend/src/app/monitoring/route.ts`,
+which forwards): `SENTRY_DISABLED=true` → off (when unset or empty, the baked
+`NEXT_PUBLIC_SENTRY_DISABLED` supplies this default); `SENTRY_DSN` (`FRONTEND_SENTRY_DSN`
+in compose) → that project; `NEXT_PUBLIC_SENTRY_DSN` baked at image build →
+that project; otherwise the built-in Mike project. `SENTRY_ENVIRONMENT` and
+`SENTRY_INSTALL` at runtime override what the bundle was built with. The rule
+that applied is printed once at boot (`[sentry] web app reports → ...`) and
+answered by `GET /monitoring` (`{"reports":"runtime"}` etc., plus
+`"disabledBy":"runtime"|"build"` when off, never the DSN), so
+a pulled image honours the operator's opt-out and destination without a
+rebuild and the operator can see that it did. Backend test
 processes (vitest, `NODE_ENV=test`) never report unless
 `SENTRY_ALLOW_IN_TESTS=true`. Browser tests disable reporting or use intercepted
 transports. Every event carries `install=community` unless
@@ -306,10 +319,10 @@ Backend (`backend/.env`, read at process start):
 
 ```
 SENTRY_DISABLED=false                  # true = send nothing
-SENTRY_DSN=                            # your own Sentry; empty = Mike project Sentry
+SENTRY_DSN=                            # your own Sentry; empty = image default, then Mike project
 SENTRY_INSTALL=                        # "official" only on Mike's own deployment
 SENTRY_ENVIRONMENT=production          # defaults to self-hosted
-SENTRY_RELEASE=mike@1.4.0              # optional; defaults to mike@<git sha>
+SENTRY_RELEASE=mike@1.4.0              # optional; defaults to mike@<MIKE_VERSION>+<sha12>
 SENTRY_TRACES_SAMPLE_RATE=0            # optional, 0..1
 SENTRY_ENABLE_TEST_ROUTE=false         # see "Verifying" below
 ```
@@ -319,39 +332,91 @@ Do not add `SENTRY_DSN` to the `environment:` block of the backend service in
 variable would blank the value from `.env`. Put it in `backend/.env` or the
 compose-root `.env`.
 
-Web app. The browser DSN is inlined by `next build`, so for the Docker image it
-is a build argument; the Next server reads its own DSN at runtime:
+The backend image stores its reporting defaults in `MIKE_BUILD_SENTRY_DSN`
+and `MIKE_BUILD_SENTRY_DISABLED`. A non-empty runtime `SENTRY_DSN` or
+`SENTRY_DISABLED` overrides the corresponding default; empty values preserve
+it. Leave `MIKE_VERSION` and `GIT_SHA` commented in the sample `.env` when
+using published images so their baked release identity survives `env_file`.
+Without a version the release is `mike@0.0.0` (plus `+<sha12>` if available).
+
+Web app. One runtime setting on the Next server decides where every web-app
+report goes, the server's own and the browser's: the browser SDK always starts
+with a placeholder DSN, and every envelope it produces goes to the Next
+server's `/monitoring` route, which applies the same rule and forwards. The
+published images therefore need no build-time configuration at all:
 
 ```
-# root .env (Docker Compose)
+# root .env (Docker Compose); the Next server reads these at runtime
+SENTRY_DISABLED=false                  # true = nothing leaves, browser included
 FRONTEND_SENTRY_DSN=https://<key>@<org>.ingest.sentry.io/<project>
 SENTRY_ENVIRONMENT=production
-SENTRY_RELEASE=mike@1.4.0
+SENTRY_INSTALL=                        # "official" only on Mike's own deployment
 
-# or, building the frontend directly
-NEXT_PUBLIC_SENTRY_DISABLED=true       # browser opt-out (build time)
-NEXT_PUBLIC_SENTRY_INSTALL=official    # only on Mike's own deployment
-NEXT_PUBLIC_SENTRY_DSN=...             # browser (build time)
-NEXT_PUBLIC_SENTRY_ENVIRONMENT=...     # optional
-NEXT_PUBLIC_SENTRY_RELEASE=...         # optional
-SENTRY_DSN=...                         # Next server (runtime)
+# building the frontend yourself (optional): build-time defaults
+NEXT_PUBLIC_SENTRY_DISABLED=true       # server/tunnel default to off; runtime false re-enables both
+NEXT_PUBLIC_SENTRY_DSN=...             # used when SENTRY_DSN is not set at runtime
 ```
+
+Check which rule applied on a running deployment: the boot log line
+`[sentry] web app reports → ...`, or `curl -s https://<host>/monitoring`, which
+answers `{"reports":"disabled"|"runtime"|"build"|"default"}` (with
+`"disabledBy":"runtime"|"build"` when off) and never the DSN. An explicit
+runtime `SENTRY_DISABLED` (`true` or `false`) always wins over the image's baked
+default; the shipped `.env.example` sets `false`.
+
+The `/monitoring` route is not an open relay: the destination is the server's
+own configuration, the client's envelope header is overwritten with it, and a
+malformed operator DSN drops envelopes rather than falling back upstream.
 
 Use a separate Sentry project for the web app and the backend: separate issue
 streams, separate source maps, and the frontend DSN is public in the bundle.
 
 ### Releases
 
-Every event carries a release so Sentry can flag a regression in a deploy and
-resolve an issue "until the next release". Set `SENTRY_RELEASE` explicitly, or
-leave it unset and build with the commit hash; the images then tag events
-`mike@<sha>`:
+Every event carries a release so Sentry can flag a regression in a release and
+resolve an issue "until the next release". The release is
+`mike@<version>+<sha12>`: the product version from `/VERSION` plus the commit,
+in Sentry's `package@version+build` form, so releases order by version (an old
+self-hosted install reporting late sorts where it belongs, not after the fix)
+while the build metadata still names the exact commit. The same string is
+produced by every runtime (`frontend/src/shared/lib/sentryEvent.ts`,
+`backend/src/lib/observability/sentry.ts`) and by both source-map build plugins
+(`frontend/src/shared/lib/releaseName.cjs`), so uploaded maps attach to the
+release the events carry.
 
-```bash
-GIT_SHA=$(git rev-parse HEAD) docker compose build
-```
+Where the parts come from:
 
-`GIT_SHA` is a build argument for all three images, never a runtime variable.
+| Build | Release | Image tags |
+| --- | --- | --- |
+| `v<VERSION>` tag, published by CI | `mike@2.1.0+<sha12>` | `2.1.0`, `latest` |
+| push to `main`, published by CI | `mike@2.1.0-dev.<run>+<sha12>` | `2.1.0-dev.<run>`, `main` |
+| your own `docker compose build` with `MIKE_VERSION=$(cat VERSION) GIT_SHA=$(git rev-parse HEAD)` | `mike@2.1.0+<sha12>` | local |
+| your own build without them | `mike@0.0.0+<sha12>` or `mike@0.0.0` | local |
+
+`0.0.0` is deliberate: a build that did not come from the release workflow is
+valid but visibly not a release, and the backend warns about it at boot in
+production. Set `MIKE_VERSION` and `GIT_SHA` as build arguments for images you
+build yourself; leave them unset at runtime when using published images so
+the baked identity is preserved. `SENTRY_RELEASE` overrides the whole string
+when set; it must not contain customer information.
+
+Each release uses the original image digests. The workflow retains each build
+in GHCR as `mike-{backend,frontend}:build-<version>`, with the source commit and
+version in its image labels. It builds only after a registry lookup confirms
+the image is absent; authentication, network and unexpected registry errors
+stop the run. An existing version must match its saved build exactly.
+
+All refs share one workflow concurrency group so publications cannot interleave
+their `latest` or `main` updates. Only main-branch builds update `main`. After
+both builds succeed, publication attaches both immutable version tags, then
+the floating tags, then finalizes the Sentry release for both projects. Registry
+writes across repositories are not atomic: an interrupted publication can leave
+some tags attached. Rerun the failed jobs or the full workflow to finish it;
+both paths reuse the saved digests, accept matching existing tags, and complete
+missing writes without rebuilding. Recovery does not depend on expiring Actions
+artifacts. Keep the `build-<version>` registry tags; exclude them from cleanup.
+If a published version loses its saved build, the workflow refuses to rebuild it.
+It records no deploy: publishing an image is not deploying it.
 
 Word add-in (build time, `word-addin/.env` or the Docker build arguments):
 
@@ -366,9 +431,16 @@ REACT_APP_SENTRY_RELEASE=...           # optional
 
 Production bundles are minified. Without source maps a frontend issue's
 culprit reads `_next/static/chunks/0vffwuerb8hxi.js:1:6381` and Sentry cannot
-say which component threw. To see `src/app/...:line` instead, provide upload
-credentials at build time; the build then uploads the maps to Sentry and
-deletes them from the output so they never ship:
+say which component threw. Sentry matches a frame to its map by the debug ID
+stamped into the bundle at build time, so only the exact bundle that was
+uploaded resolves: a rebuild elsewhere, however similar, does not. That is why
+the published images exist (`docs/deployment.md`, "Running the published
+images"): CI builds each release once, uploads its maps, and publishes that
+bundle, so every deployment running the official image gets readable frames
+without holding any Sentry credential.
+
+Building yourself, provide upload credentials at build time; the build then
+uploads the maps to Sentry and deletes them from the output so they never ship:
 
 ```
 SENTRY_AUTH_TOKEN=...   # organization auth token, see below
@@ -385,7 +457,8 @@ and `NODE_OPTIONS` in the Dockerfile), so backend frames already read
 
 The build plugin stamps each bundle with a debug ID and uploads the maps
 under it, so frames resolve regardless of the release name; the release tag on
-events still comes from `GIT_SHA` / `SENTRY_RELEASE` as described above.
+events still comes from `MIKE_VERSION` and `GIT_SHA`, or the explicit
+`SENTRY_RELEASE` override, as described above.
 
 #### Setting it up in Sentry
 
@@ -415,13 +488,16 @@ builds keep working. When the enabled build step executes, a missing token,
 organization or project fails the build instead of silently skipping upload.
 A cache hit skips that step and its credential validation.
 
-Docker Compose (Dokploy and similar): put these non-secret settings in the
-compose-root `.env` or the platform's environment:
+Docker Compose (Dokploy and similar): put these non-secret settings, plus
+`MIKE_VERSION` and `GIT_SHA` for the release identity, in the compose-root
+`.env` or the platform's environment; `docker-compose.yml` forwards them to the
+frontend build:
 
 ```
 SENTRY_UPLOAD_ENABLED=1
 SENTRY_ORG=<org slug>
 SENTRY_PROJECT=<web app project slug>
+MIKE_VERSION=<contents of VERSION>
 GIT_SHA=<commit being deployed>
 SENTRY_ENVIRONMENT=production
 ```
@@ -451,6 +527,7 @@ docker build -f frontend/Dockerfile \
   --secret id=SENTRY_AUTH_TOKEN,src=/secure/path/sentry-token \
   --build-arg SENTRY_UPLOAD_ENABLED=1 \
   --build-arg SENTRY_ORG=<org> --build-arg SENTRY_PROJECT=<project> \
+  --build-arg MIKE_VERSION=$(cat VERSION) \
   --build-arg GIT_SHA=$(git rev-parse HEAD) \
   --build-arg NEXT_PUBLIC_SENTRY_DSN=... .
 ```
@@ -459,6 +536,44 @@ For `word-addin/Dockerfile`, use the add-in's project slug and also pass its
 required `--build-arg REACT_APP_WEB_APP_URL=https://<web app host>` (and
 `WORD_ADDIN_PUBLIC_URL` when configuring its manifest). Compose builds the web
 app only; build the add-in image separately.
+
+#### How CI publishes (and what a fork gets)
+
+`.github/workflows/publish-images.yml` runs on pushes to `main` and `v*` tags,
+never on pull requests, so neither forks' PRs nor contributors ever see the
+token. An administrator sets, on the repository:
+
+- secret `SENTRY_AUTH_TOKEN` (organization token, scope `org:ci`);
+- variables `SENTRY_ORG`, `SENTRY_PROJECT_FRONTEND`, `SENTRY_PROJECT_BACKEND`.
+
+Upstream publication requires all four settings, including for `main` and
+manual builds. Missing credentials or blank project/organization variables
+fail the identity job before any registry lookup or build. This prevents
+retaining a mapless image that a later retry would reuse instead of rebuilding.
+Forks retain the optional-upload behavior described below.
+
+For a new build with uploads enabled, the workflow passes
+`SENTRY_UPLOAD_ENABLED=1` and rebuilds the frontend `app` stage
+(`no-cache-filters`): the switch separates token-less and token builds in the
+cache, and bypassing the stage cache ensures the upload executes because secret
+contents are not part of the cache key. Retries reuse saved images instead of
+rebuilding them. For both new and reused builds the workflow asks Sentry's API
+(`files/artifact-bundles/`) whether a bundle is associated with the release and
+fails the run if not.
+
+Where events go is decided together with where maps go, so a fork never
+reports upstream by accident. The image owner is the repository owner, so a
+fork publishes to `ghcr.io/<owner>/mike-*` with no setup, and:
+
+| Repository | Events | Source maps |
+| --- | --- | --- |
+| `open-legal-products` | built-in Mike DSNs | required; missing configuration stops publication before building |
+| fork with `FORK_SENTRY_DSN_FRONTEND` and `FORK_SENTRY_DSN_BACKEND` variables | the fork's own projects (baked as defaults, overridable at runtime) | uploaded to the fork's org when its own secret and variables are set |
+| fork without them | reporting disabled in every runtime (`SENTRY_DISABLED=true` baked as the image default; an explicit runtime value wins, and the stock `.env.example` sets `SENTRY_DISABLED=false`, so a fork's operators set it to `true`) | none |
+
+Self-hosted Sentry servers (`SENTRY_URL`) are not supported by the workflow.
+The Word add-in image is not published (its build bakes the deployment's
+web-app URL); build it with your own token as above to get readable frames.
 
 **Rotating, removing or revalidating the token, or repeating an upload for
 unchanged source:** secret contents are excluded from BuildKit's cache key.

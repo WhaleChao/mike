@@ -36,17 +36,19 @@ vi.mock("@sentry/nextjs", () => ({
 
 import * as Sentry from "@sentry/nextjs";
 import {
+    API_UNREACHABLE_WINDOW_MS,
     browserSentryOptions,
+    describeReportingDestination,
     isReported,
+    markErrorHandled,
     reportApiFailure,
     reportError,
+    reportingDestination,
+    reportNetworkFailure,
+    resetApiUnreachableWindow,
     scrubEvent,
     serverSentryOptions,
     setReportingUser,
-    API_UNREACHABLE_WINDOW_MS,
-    markErrorHandled,
-    reportNetworkFailure,
-    resetApiUnreachableWindow,
     trackPendingRequest,
 } from "./errorReporting";
 import { MIKE_SENTRY_DSN } from "@/shared/lib/sentryEvent";
@@ -273,7 +275,7 @@ describe("browserSentryOptions", () => {
         expect(options.enabled).toBe(true);
         expect(options.dsn).toBe(MIKE_SENTRY_DSN.frontend);
         expect(options.environment).toBe("self-hosted");
-        expect(options.release).toBeUndefined();
+        expect(options.release).toBe("mike@0.0.0");
         expect(options.dataCollection).toEqual({
             userInfo: false,
             cookies: false,
@@ -290,17 +292,19 @@ describe("browserSentryOptions", () => {
         expect(options.tracesSampleRate).toBe(0);
         expect(options.beforeSend).toBe(scrubEvent);
         expect(options).not.toHaveProperty("replaysOnErrorSampleRate");
+        // Every envelope goes through the Next server, which applies the
+        // deployment's runtime opt-out and DSN (app/monitoring/route.ts).
+        expect(options.tunnel).toBe("/monitoring");
     });
 
-    it("reads the DSN, environment, release, and sample rate", () => {
+    it("reads the environment, release, and sample rate while leaving the destination to the tunnel", () => {
         const options = browserSentryOptions({
-            dsn: " https://k@o1.ingest.sentry.io/2 ",
             environment: "staging",
             release: "mike@1.0.0",
             tracesSampleRate: "0.25",
         });
         expect(options.enabled).toBe(true);
-        expect(options.dsn).toBe("https://k@o1.ingest.sentry.io/2");
+        expect(options.dsn).toBe(MIKE_SENTRY_DSN.frontend);
         expect(options.environment).toBe("staging");
         expect(options.release).toBe("mike@1.0.0");
         expect(options.tracesSampleRate).toBe(0.25);
@@ -317,10 +321,7 @@ describe("browserSentryOptions", () => {
         });
     });
 
-    it("is off with the disabled flag, and marks the official deployment", () => {
-        const off = browserSentryOptions({ disabled: "true", dsn: "https://k@o1.ingest.sentry.io/2" });
-        expect(off.enabled).toBe(false);
-        expect(off.dsn).toBeUndefined();
+    it("marks the official deployment", () => {
         const official = browserSentryOptions({ install: "official" });
         expect((official.initialScope as { tags: { install: string } }).tags.install).toBe("official");
     });
@@ -332,17 +333,24 @@ describe("browserSentryOptions", () => {
 });
 
 describe("release tagging", () => {
-    it("falls back to the git sha for both the browser and the server options", () => {
-        expect(browserSentryOptions({ dsn: "https://k@o.ingest.sentry.io/1", gitSha: "abcdef1234567890" }).release).toBe(
-            "mike@abcdef123456",
-        );
+    it("builds mike@<version>+<sha12> for both the browser and the server options", () => {
+        expect(
+            browserSentryOptions({
+                version: "2.1.0",
+                gitSha: "abcdef1234567890",
+            }).release,
+        ).toBe("mike@2.1.0+abcdef123456");
+        expect(
+            browserSentryOptions({ gitSha: "abcdef1234567890" }).release,
+        ).toBe("mike@0.0.0+abcdef123456");
         expect(
             serverSentryOptions("server", {
                 NODE_ENV: "test",
                 SENTRY_DSN: "https://k@o.ingest.sentry.io/1",
+                MIKE_VERSION: "2.1.0",
                 GIT_SHA: "abcdef1234567890",
             } as NodeJS.ProcessEnv).release,
-        ).toBe("mike@abcdef123456");
+        ).toBe("mike@2.1.0+abcdef123456");
         expect(
             serverSentryOptions("server", {
                 NODE_ENV: "test",
@@ -350,6 +358,94 @@ describe("release tagging", () => {
                 GIT_SHA: "abcdef1234567890",
             } as NodeJS.ProcessEnv).release,
         ).toBe("mike@3.1.0");
+    });
+});
+
+describe("reportingDestination", () => {
+    const own = "https://k@o9.ingest.sentry.io/9";
+    const baked = "https://b@o8.ingest.sentry.io/8";
+
+    it("honours the fork image's baked opt-out for server and edge reporting", () => {
+        for (const runtime of ["server", "edge"] as const) {
+            for (const disabled of [undefined, ""]) {
+                const env = { NODE_ENV: "test", NEXT_PUBLIC_SENTRY_DISABLED: "true", SENTRY_DISABLED: disabled } as NodeJS.ProcessEnv;
+                expect(reportingDestination(env)).toEqual({ dsn: "", source: "disabled", disabledBy: "build" });
+                expect(serverSentryOptions(runtime, env).enabled).toBe(false);
+            }
+        }
+        expect(reportingDestination({
+            NODE_ENV: "test", NEXT_PUBLIC_SENTRY_DISABLED: "true", SENTRY_DISABLED: "false", SENTRY_DSN: own,
+        } as NodeJS.ProcessEnv)).toMatchObject({ source: "runtime", dsn: own });
+    });
+
+    it("is one rule for server and browser: disabled, runtime, build, default", () => {
+        expect(reportingDestination({ SENTRY_DISABLED: "true", SENTRY_DSN: own } as unknown as NodeJS.ProcessEnv)).toEqual({
+            dsn: "",
+            source: "disabled",
+            disabledBy: "runtime",
+        });
+        expect(reportingDestination({ SENTRY_DSN: ` ${own} `, NEXT_PUBLIC_SENTRY_DSN: baked } as unknown as NodeJS.ProcessEnv)).toEqual({
+            dsn: own,
+            source: "runtime",
+        });
+        expect(reportingDestination({ NEXT_PUBLIC_SENTRY_DSN: baked } as unknown as NodeJS.ProcessEnv)).toEqual({
+            dsn: baked,
+            source: "build",
+        });
+        expect(reportingDestination({} as unknown as NodeJS.ProcessEnv)).toEqual({
+            dsn: MIKE_SENTRY_DSN.frontend,
+            source: "default",
+        });
+    });
+
+    it("carries the runtime environment and install overrides", () => {
+        expect(
+            reportingDestination({ SENTRY_ENVIRONMENT: " production ", SENTRY_INSTALL: "official" } as unknown as NodeJS.ProcessEnv),
+        ).toMatchObject({ environment: "production", install: "official" });
+        expect(reportingDestination({ SENTRY_INSTALL: "other" } as unknown as NodeJS.ProcessEnv).install).toBe("community");
+    });
+
+    it("says which variable switched reporting off", () => {
+        expect(reportingDestination({ SENTRY_DISABLED: "true" } as unknown as NodeJS.ProcessEnv)).toEqual({
+            dsn: "",
+            source: "disabled",
+            disabledBy: "runtime",
+        });
+        expect(reportingDestination({ NEXT_PUBLIC_SENTRY_DISABLED: "true" } as unknown as NodeJS.ProcessEnv)).toEqual({
+            dsn: "",
+            source: "disabled",
+            disabledBy: "build",
+        });
+        expect(
+            describeReportingDestination(reportingDestination({ SENTRY_DISABLED: "true" } as unknown as NodeJS.ProcessEnv)),
+        ).toContain("SENTRY_DISABLED=true at runtime");
+        expect(
+            describeReportingDestination(
+                reportingDestination({ NEXT_PUBLIC_SENTRY_DISABLED: "true" } as unknown as NodeJS.ProcessEnv),
+            ),
+        ).toContain("set SENTRY_DISABLED=false to override");
+    });
+
+    it("shows ? for the project when the DSN has no path", () => {
+        expect(describeReportingDestination({ dsn: "https://k@host.example", source: "runtime" })).toContain("project ? (runtime)");
+    });
+
+    it("describes the rule for the boot log without leaking the DSN key", () => {
+        const line = describeReportingDestination(reportingDestination({ SENTRY_DSN: own } as unknown as NodeJS.ProcessEnv));
+        expect(line).toContain("SENTRY_DSN project 9 (runtime)");
+        expect(line).not.toContain("k@");
+        expect(describeReportingDestination(reportingDestination({ NEXT_PUBLIC_SENTRY_DSN: baked } as unknown as NodeJS.ProcessEnv))).toContain(
+            "baked at build",
+        );
+        expect(describeReportingDestination(reportingDestination({ SENTRY_DISABLED: "true" } as unknown as NodeJS.ProcessEnv))).toContain("off");
+        expect(describeReportingDestination(reportingDestination({} as unknown as NodeJS.ProcessEnv))).toContain("community default");
+    });
+
+    it("drives the Next server's own SDK, so a baked DSN is honoured there too", () => {
+        expect(serverSentryOptions("server", { NEXT_PUBLIC_SENTRY_DSN: baked } as unknown as NodeJS.ProcessEnv).dsn).toBe(baked);
+        expect(
+            serverSentryOptions("server", { NEXT_PUBLIC_SENTRY_DSN: baked, SENTRY_DSN: own } as unknown as NodeJS.ProcessEnv).dsn,
+        ).toBe(own);
     });
 });
 
@@ -378,7 +474,7 @@ describe("serverSentryOptions", () => {
         );
         expect(options.enabled).toBe(true);
         expect(options.dsn).toBe(MIKE_SENTRY_DSN.frontend);
-        expect(options.release).toBeUndefined();
+        expect(options.release).toBe("mike@0.0.0");
         expect(options.environment).toBe("self-hosted");
         const withNodeEnv = serverSentryOptions("server", {
             NODE_ENV: "production",
