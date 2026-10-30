@@ -2683,107 +2683,6 @@ as $$
 $$;
 
 drop function if exists public.get_chats_overview(text, text, integer, integer, timestamptz, uuid);
-create or replace function public.get_chats_overview(
-  p_user_id text,
-  p_user_email text,
-  p_limit integer default null,
-  p_offset integer default 0,
-  p_before_updated_at timestamptz default null,
-  p_before_id uuid default null,
-  p_workspace text default null
-)
-returns table (
-  id uuid,
-  project_id uuid,
-  user_id text,
-  title text,
-  model text,
-  created_at timestamptz,
-  updated_at timestamptz,
-  project_name text,
-  is_owner boolean,
-  access_role text
-)
-language plpgsql
-stable
-set search_path = public
-as $$
-declare
-  candidate record;
-  skipped integer := 0;
-  returned integer := 0;
-  row_limit integer := case when p_limit is null then null else greatest(1,least(p_limit,100)) end;
-begin
-  for candidate in
-  -- Narrow with indexed identity/grant lookups before invoking the canonical
-  -- permission function. Walking every tenant's chats in updated_at order
-  -- makes an inactive user's first page cost grow with unrelated traffic.
-  -- These candidates are an over-approximation, never an access decision.
-  with actor as materialized (
-    select case
-      when p_user_id ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-      then p_user_id::uuid
-    end as id
-  ), member_orgs as materialized (
-    select m.org_id from public.org_members m
-    join actor a on a.id = m.user_id
-  ), candidate_projects as materialized (
-    select p.id from public.projects p join actor a on a.id = p.user_id
-    union
-    select g.project_id from public.project_access_grants g
-      where coalesce(p_user_email, '') <> '' and g.email = lower(p_user_email)
-    union
-    select p.id from public.projects p join member_orgs m on m.org_id = p.org_id
-  ), candidate_ids as materialized (
-    select c.id from public.chats c join actor a on a.id = c.user_id
-    union
-    select g.chat_id from public.chat_access_grants g
-      where coalesce(p_user_email, '') <> '' and g.email = lower(p_user_email)
-    union
-    select c.id from public.chats c join member_orgs m on m.org_id = c.org_id
-    union
-    select c.id from public.chats c
-      join candidate_projects p on p.id = c.project_id
-  )
-  select c.*, p.name as project_name
-  from candidate_ids ids
-  join public.chats c on c.id = ids.id
-  left join public.projects p on p.id = c.project_id
-  where public.workspace_matches(p_workspace, c.org_id)
-    and (
-      p_before_updated_at is null
-      or c.updated_at < p_before_updated_at
-      or (c.updated_at = p_before_updated_at and c.id > p_before_id)
-    )
-  order by c.updated_at desc, c.id asc
-  loop
-    -- Evaluate the authoritative verdict once, and stop after a page. In
-    -- particular, do not materialize role checks for all of an active user's
-    -- old chats just to return their newest fifty.
-    access_role := public.chat_access_role(
-      candidate.id,candidate.user_id,candidate.project_id,candidate.org_id,p_user_id,p_user_email
-    );
-    if access_role is null then continue; end if;
-    if skipped < greatest(coalesce(p_offset,0),0) then
-      skipped := skipped + 1;
-      continue;
-    end if;
-    id := candidate.id;
-    project_id := candidate.project_id;
-    user_id := candidate.user_id::text;
-    title := candidate.title;
-    model := candidate.model;
-    created_at := candidate.created_at;
-    updated_at := candidate.updated_at;
-    project_name := candidate.project_name;
-    is_owner := coalesce(candidate.user_id::text = p_user_id,false);
-    return next;
-    returned := returned + 1;
-    if row_limit is not null and returned >= row_limit then exit; end if;
-  end loop;
-end;
-$$;
-
 create table if not exists public.chat_messages (
   id uuid primary key default gen_random_uuid(),
   chat_id uuid not null references public.chats(id) on delete cascade,
@@ -10300,6 +10199,141 @@ as $$
       limit 1
     )
   end), public.org_private_access_role(p_org_id,'chat',p_chat_id,p_user_id));
+$$;
+
+-- GET /chat. The list form of chat_access_role above: the same ladder, evaluated
+-- with set-based joins so the planner reaches the caller's chats through indexes
+-- instead of calling the verdict for every row (MIKE-BACKEND-F). Kept next to
+-- the verdict it mirrors; backend/src/modules/chat/__tests__/chat.overview.sql
+-- proves the two agree row for row.
+create or replace function public.get_chats_overview(
+  p_user_id text,
+  p_user_email text,
+  p_limit integer default null,
+  p_offset integer default 0,
+  p_before_updated_at timestamptz default null,
+  p_before_id uuid default null,
+  p_workspace text default null
+)
+returns table (
+  id uuid,
+  project_id uuid,
+  user_id text,
+  title text,
+  model text,
+  created_at timestamptz,
+  updated_at timestamptz,
+  project_name text,
+  is_owner boolean,
+  access_role text
+)
+language sql
+stable
+set search_path = public
+as $$
+with actor as materialized (
+  select
+    case when p_user_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+         then p_user_id::uuid end as id,
+    case when coalesce(p_user_email, '') <> '' then lower(p_user_email) end as email
+),
+membership as materialized (
+  select m.org_id, m.role,
+         (o.kind = 'team' and o.deleted_at is null
+          and (m.role = 'owner' or (m.role = 'admin' and m.can_access_private_content))) as opens_private
+  from public.org_members m
+  join public.organizations o on o.id = m.org_id
+  where m.user_id = (select id from actor)
+),
+project_candidates as materialized (
+  select p.id from public.projects p where p.user_id = (select id from actor)
+  union
+  select p.id from public.projects p join membership m on m.org_id = p.org_id
+  union
+  select g.project_id from public.project_access_grants g where g.email = (select email from actor)
+  union
+  select x.item_id from public.org_private_content_access x
+    where x.user_id = (select id from actor) and x.kind = 'project'
+),
+reachable_projects as materialized (
+  select p.id, p.name,
+    coalesce(
+      case
+        when p.org_id is not null and (o.id is null or o.deleted_at is not null) then null
+        when p.archived_at is not null then null
+        when p.org_id is not null then
+          case
+            when m.org_id is null then null
+            when p.user_id = (select id from actor) then 'owner'
+            when m.role = 'owner' and (p.visibility = 'organization'
+                 or public.project_is_ownerless(p.id, p.user_id, p.org_id)) then 'owner'
+            when ov.role = 'deny' then null
+            when ov.role in ('owner', 'editor', 'viewer') then ov.role
+            when p.visibility = 'organization' then 'editor'
+          end
+        when p.user_id = (select id from actor) then 'owner'
+        else g.role
+      end,
+      case when x.item_id is not null and m.opens_private
+                and p.archived_at is null and p.visibility = 'private' then 'viewer' end
+    ) as role
+  from project_candidates c
+  join public.projects p on p.id = c.id
+  left join public.organizations o on o.id = p.org_id
+  left join membership m on m.org_id = p.org_id
+  left join public.project_org_access_overrides ov
+    on ov.project_id = p.id and ov.org_id = p.org_id and ov.user_id = (select id from actor)
+  left join public.project_access_grants g on g.project_id = p.id and g.email = (select email from actor)
+  left join public.org_private_content_access x
+    on x.org_id = p.org_id and x.user_id = (select id from actor) and x.kind = 'project' and x.item_id = p.id
+),
+granted_chats as materialized (
+  select g.chat_id, g.role from public.chat_access_grants g where g.email = (select email from actor)
+),
+opened_chats as materialized (
+  select x.org_id, x.item_id from public.org_private_content_access x
+  where x.user_id = (select id from actor) and x.kind = 'chat'
+)
+select c.id, c.project_id, c.user_id::text as user_id, c.title, c.model, c.created_at, c.updated_at,
+       rp.name as project_name,
+       coalesce(c.user_id = (select id from actor), false) as is_owner,
+       verdict.role as access_role
+from public.chats c
+left join reachable_projects rp on rp.id = c.project_id
+left join granted_chats g on g.chat_id = c.id
+left join opened_chats x on x.item_id = c.id and x.org_id = c.org_id
+left join membership m on m.org_id = c.org_id
+left join public.organizations o on o.id = c.org_id
+cross join lateral (
+  select coalesce(
+    case
+      when c.org_id is not null and (o.id is null or o.deleted_at is not null) then null
+      when c.project_id is not null then rp.role
+      when o.kind = 'team' then
+        case when m.org_id is null then null
+             when c.user_id = (select id from actor) then 'owner'
+             else g.role end
+      when c.user_id = (select id from actor) then 'owner'
+      else g.role
+    end,
+    case when x.item_id is not null and m.opens_private and c.project_id is null then 'viewer' end
+  ) as role
+) verdict
+where c.archived_at is null
+  and public.workspace_matches(p_workspace, c.org_id)
+  and (
+    p_before_updated_at is null
+    or c.updated_at < p_before_updated_at
+    or (c.updated_at = p_before_updated_at and c.id > p_before_id)
+  )
+  and (c.user_id = (select id from actor)
+    or c.project_id = any (array(select id from reachable_projects where role is not null))
+    or c.id = any (array(select chat_id from granted_chats))
+    or c.id = any (array(select item_id from opened_chats)))
+  and verdict.role is not null
+order by c.updated_at desc, c.id asc
+limit case when p_limit is null then null else greatest(1, least(p_limit, 100)) end
+offset greatest(coalesce(p_offset, 0), 0);
 $$;
 
 create or replace function public.review_access_role(
