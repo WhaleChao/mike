@@ -772,7 +772,17 @@ async function heartbeatJob(db: Db, jobId: string, workerId: string) {
     .eq("locked_by", workerId)
     .select("id")
     .maybeSingle();
-  if (error || !data) throw error ?? new Error("upload_job_lease_lost");
+  if (error || !data) throw error ?? leaseLost();
+}
+
+/**
+ * The job row no longer says this worker holds it: another worker claimed
+ * it after the lease aged out, or a sweep retired it. Named, so Sentry files
+ * it under its own kind (MIKE-BACKEND-M grouped every code-less iteration
+ * failure as one anonymous "Failure in upload-worker / iteration").
+ */
+function leaseLost(): AppError {
+  return new AppError("upload.lease_lost", "upload_job_lease_lost");
 }
 
 async function refreshUploadSessionStatus(
@@ -838,7 +848,8 @@ export async function processUploadJob(
     .eq("status", "running")
     .eq("locked_by", workerId)
     .single();
-  if (jobError || !job) throw jobError ?? new Error("upload_job_not_found");
+  if (jobError || !job)
+    throw jobError ?? new AppError("upload.job_missing", "upload_job_not_found");
   const typedJob = job as UploadJobRow;
   const { data: session, error: sessionError } = await db
     .from("upload_sessions")
@@ -846,7 +857,8 @@ export async function processUploadJob(
     .eq("id", typedJob.session_id)
     .single();
   if (sessionError || !session) {
-    throw sessionError ?? new Error("upload_session_not_found");
+    throw sessionError
+      ?? new AppError("upload.session_missing", "upload_session_not_found");
   }
   const typedSession = session as UploadSessionRow;
   const { data: fileRow, error: filesError } = await db
@@ -856,7 +868,8 @@ export async function processUploadJob(
     .eq("id", typedJob.file_id)
     .single();
   if (filesError || !fileRow) {
-    throw filesError ?? new Error("upload_session_file_not_found");
+    throw filesError
+      ?? new AppError("upload.file_missing", "upload_session_file_not_found");
   }
   const file = fileRow as UploadFileRow;
   const terminalUploadFailure =
@@ -1004,7 +1017,7 @@ export async function processUploadJob(
       .select("id")
       .maybeSingle();
     if (retryError || !retried) {
-      throw retryError ?? new Error("upload_job_lease_lost");
+      throw retryError ?? leaseLost();
     }
     const { error: fileRetryError } = await db
       .from("upload_session_files")
@@ -1051,7 +1064,7 @@ export async function processUploadJob(
     .select("id")
     .maybeSingle();
   if (finishError || !finished) {
-    throw finishError ?? new Error("upload_job_lease_lost");
+    throw finishError ?? leaseLost();
   }
   await refreshUploadSessionStatus(db, typedSession.id);
 }
